@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Adım sabitleri
 TITLE, DESCRIPTION, TAGS, YOUTUBE_SCHEDULE = range(4)
 
+# Planlanmış videoları saklamak için basit bir veri yapısı
+scheduled_videos = []
+
 # YouTube API kullanarak videoyu yükle
 def upload_video_to_youtube(file_path, title, description, tags, scheduled_time=None):
     """YouTube API kullanarak videoyu yükleyen fonksiyon."""
@@ -82,14 +85,19 @@ def upload_video_to_youtube(file_path, title, description, tags, scheduled_time=
     return video_id
 
 # Geri sayım fonksiyonu
-def start_countdown(seconds, update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start_countdown(seconds, video_data, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Verilen süreyi bekleyip video yüklemeyi başlatır."""
     logger.info(f"Geri sayım başladı: {seconds} saniye")
     while seconds > 0:
         time.sleep(1)
         seconds -= 1
-    context.bot.send_message(chat_id=update.effective_chat.id, text="Hey! Süre doldu, videonu YouTube'a yüklüyorum...")
-    upload_video_to_youtube(context.user_data['file_path'], context.user_data['title'], context.user_data['description'], context.user_data.get('tags', ''), context.user_data['youtube_schedule'])
+
+    # Geri sayım tamamlanınca YouTube'a video yükle
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"Hey! Süre doldu, '{video_data['title']}' başlıklı videon YouTube'a yükleniyor...")
+    upload_video_to_youtube(video_data['file_path'], video_data['title'], video_data['description'], video_data.get('tags', ''), video_data['youtube_schedule'])
+
+    # Video yüklendikten sonra listeyi güncelle
+    scheduled_videos.remove(video_data)
 
 # Videonun başlığını kullanıcıdan al
 async def ask_for_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,28 +142,72 @@ async def process_youtube_schedule(update: Update, context: ContextTypes.DEFAULT
 
         now = datetime.now()
 
+        video_data = {
+            'file_path': context.user_data['file_path'],
+            'title': context.user_data['title'],
+            'description': context.user_data['description'],
+            'tags': context.user_data.get('tags', ''),
+            'youtube_schedule': youtube_schedule_time,
+            'bot_schedule': bot_schedule_time
+        }
+
         # Eğer bot zamanlaması şu anki zamandan önceyse (yani 10 dakikadan az süre varsa), doğrudan yükle
         if bot_schedule_time < now:
             await update.message.reply_text(f"Vay be! Yükleme zamanı çok yakın. Videoyu hemen YouTube'a gönderiyorum! 🚀")
-            upload_video_to_youtube(context.user_data['file_path'], context.user_data['title'], context.user_data['description'], context.user_data.get('tags', ''), youtube_schedule_time)
-            return ConversationHandler.END
+            upload_video_to_youtube(video_data['file_path'], video_data['title'], video_data['description'], video_data.get('tags', ''), youtube_schedule_time)
         else:
             await update.message.reply_text(f"Tamamdır! Video YouTube'da {youtube_schedule_time} tarihinde yayımlanacak. Bot, {bot_schedule_time} tarihinde yüklemeye başlayacak. 📅")
             # Geri sayım süresini hesapla
             countdown_seconds = (bot_schedule_time - now).total_seconds()
+            scheduled_videos.append(video_data)  # Videoyu planlananlar listesine ekle
             # Geri sayımı başlat
-            countdown_thread = Thread(target=start_countdown, args=(countdown_seconds, update, context))
+            countdown_thread = Thread(target=start_countdown, args=(countdown_seconds, video_data, update, context))
             countdown_thread.start()
-            return ConversationHandler.END
+        return ConversationHandler.END
 
     except ValueError:
         await update.message.reply_text("Hmmm, sanırım yanlış bir format girdin. 🧐 Lütfen 'Gün Ay Yıl Saat:Dakika' formatında gir.")
         return YOUTUBE_SCHEDULE
 
+# Planlanan videoları listele
+async def list_scheduled_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Planlanmış videoları listeler."""
+    if not scheduled_videos:
+        await update.message.reply_text("Şu anda planlanmış hiçbir video yok. 📭")
+        return
+
+    # Planlanmış videoları listele
+    message = "📅 Planlanmış Videolar:\n"
+    for idx, video in enumerate(scheduled_videos, 1):
+        message += f"{idx}. {video['title']} - {video['youtube_schedule'].strftime('%Y-%m-%d %H:%M')}\n"
+    message += "\nBir videoyu iptal etmek için /iptal [numara] komutunu kullanın."
+    await update.message.reply_text(message)
+
+# Planlanan bir videoyu iptal et
+async def cancel_scheduled_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Planlanmış bir videoyu iptal eder."""
+    try:
+        video_idx = int(context.args[0]) - 1
+        if 0 <= video_idx < len(scheduled_videos):
+            canceled_video = scheduled_videos.pop(video_idx)
+            await update.message.reply_text(f"'{canceled_video['title']}' başlıklı video iptal edildi. 🚫")
+        else:
+            await update.message.reply_text("Geçersiz video numarası. Lütfen doğru bir numara girin.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Lütfen iptal etmek istediğiniz videonun numarasını girin. Örneğin: /iptal 1")
+
 # Videoyu indir ve yükle
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram üzerinden gönderilen videoyu indirip dosya yolunu kaydeder."""
-    video_file = await context.bot.get_file(update.message.video.file_id)  # Telegram'dan gelen video dosyasını al
+    """Telegram üzerinden gönderilen video veya dosya olarak gönderilen video dosyasını indirip dosya yolunu kaydeder."""
+    
+    if update.message.video:  # Video olarak gönderildiyse
+        video_file = await context.bot.get_file(update.message.video.file_id)
+    elif update.message.document:  # Dosya olarak gönderildiyse
+        video_file = await context.bot.get_file(update.message.document.file_id)
+    else:
+        await update.message.reply_text("Geçerli bir video dosyası gönderin (MP4 veya MOV formatında).")
+        return ConversationHandler.END
+
     file_path = f"videos/{video_file.file_id}.mp4"
 
     # 'videos' klasörünün var olup olmadığını kontrol et, yoksa oluştur
@@ -173,13 +225,38 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Başlık adımına yönlendir
     return await ask_for_title(update, context)
 
+
 # /start komutu için basit bir handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Botun başlangıç mesajını gönderir ve sıfırdan başlatır."""
     # Kullanıcı verilerini sıfırla
     context.user_data.clear()
-    await update.message.reply_text("Merhaba! 😊 Video yüklemeye hazır mısın? Bir video gönder, başlayalım! 🚀")
+    
+    # Hoş geldiniz mesajı
+    welcome_message = (
+        "Merhaba! 😊 Ben YouTube video yükleme botuyum! 🎥\n"
+        "Aşağıdaki adımları takip ederek videolarınızı YouTube'a yükleyebilirsiniz:\n\n"
+        "📌 Botun Özellikleri:\n"
+        "1. Telegram üzerinden video yükleyin.\n"
+        "2. Videonun başlık, açıklama ve etiket bilgilerini girin.\n"
+        "3. Yayınlanma zamanını planlayın (isteğe bağlı).\n"
+        "4. Videolarınızı YouTube'a yükleyin!\n\n"
+        "💡 Kullanım Talimatları:\n"
+        "- Bir video göndererek başlayın. Sonrasında bot, videonun başlığı, açıklaması ve etiketleri gibi bilgileri soracak.\n"
+        "- Eğer yükleme için bir tarih ve saat belirtirseniz, bot videonuzu planlanan zamanda YouTube'a yükleyecektir.\n\n"
+        "🔧 Komutlar:\n"
+        "- /start - Botu yeniden başlatır ve sizi karşılar.\n"
+        "- /liste - Planlanan videoların listesini gösterir.\n"
+        "- /iptal [numara] - Planlanmış bir videoyu iptal eder.\n\n"
+        "Bir video gönderin, hemen başlayalım! 🚀"
+    )
+    
+    # Mesajı kullanıcıya gönder
+    await update.message.reply_text(welcome_message)
+
     return ConversationHandler.END
+
+
 
 def main():
     """Botun ana fonksiyonu ve tüm handler'ların tanımlanması."""
@@ -188,15 +265,21 @@ def main():
 
     # Konuşma sırası
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.VIDEO, handle_video)],
-        states={
-            TITLE: [MessageHandler(filters.TEXT, ask_for_description)],
-            DESCRIPTION: [MessageHandler(filters.TEXT, ask_for_tags)],
-            TAGS: [MessageHandler(filters.TEXT, ask_for_youtube_schedule)],
-            YOUTUBE_SCHEDULE: [MessageHandler(filters.TEXT, process_youtube_schedule)],
-        },
-        fallbacks=[CommandHandler("start", start)]  # Kullanıcı ne zaman /start komutunu girerse baştan başlasın
-    )
+    entry_points=[CommandHandler("start", start), 
+                  MessageHandler(filters.VIDEO | (filters.Document.MimeType("video/mp4") | filters.Document.MimeType("video/quicktime")), handle_video)],
+    states={
+        TITLE: [MessageHandler(filters.TEXT, ask_for_description)],
+        DESCRIPTION: [MessageHandler(filters.TEXT, ask_for_tags)],
+        TAGS: [MessageHandler(filters.TEXT, ask_for_youtube_schedule)],
+        YOUTUBE_SCHEDULE: [MessageHandler(filters.TEXT, process_youtube_schedule)],
+    },
+    fallbacks=[CommandHandler("start", start)]  # Kullanıcı ne zaman /start komutunu girerse baştan başlasın
+)
+
+
+    # Komutlar ekleyelim
+    application.add_handler(CommandHandler("liste", list_scheduled_videos))
+    application.add_handler(CommandHandler("iptal", cancel_scheduled_video))
 
     # Konuşma işleyicisini ekle
     application.add_handler(conv_handler)
